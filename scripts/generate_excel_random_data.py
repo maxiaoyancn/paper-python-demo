@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
 import secrets
 import sys
@@ -17,12 +18,13 @@ from scipy import stats as sp_stats
 
 logger = logging.getLogger(__name__)
 
-GROUP1_START_COL = 9  # I 列
 LEVENE_ALPHA = 0.05
 SD_TOLERANCE = 0.10  # ±10%
 MAX_RETRY = 5
-ROUND_DIGITS = 4
-STAT_HEADERS = ("第一组均值", "第一组SD值", "第二组均值", "第二组SD值", "两组的p值")
+STAT_DIGITS = 4  # 统计回算列固定 4 位小数
+LEVENE_HEADER = "Levene p"
+SHAPIRO_HEADER = "Shapiro-Wilk min p"
+OVERALL_HEADER = "整体 p（ANOVA/KW）"
 
 
 @dataclass(slots=True, frozen=True)
@@ -37,11 +39,20 @@ class GroupSpec:
 class RowSpec:
     row_index: int
     metric: str
-    group1: GroupSpec
-    group2: GroupSpec
+    groups: tuple[GroupSpec, ...]
+    decimals: int
 
 
-def _coerce_positive_int(value: object) -> int | None:
+def _find_decimals_col(ws: Worksheet) -> int:
+    """Scan row 1 headers; return the first column whose value contains '位数'."""
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=1, column=c).value
+        if isinstance(v, str) and "位数" in v:
+            return c
+    raise LookupError("未在第 1 行找到包含'位数'的表头列")
+
+
+def _coerce_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -62,31 +73,55 @@ def _coerce_float(value: object) -> float | None:
 def read_specs(path: Path, sheet: str | None) -> list[RowSpec]:
     wb = load_workbook(path, data_only=True)
     ws: Worksheet = wb[sheet] if sheet else wb[wb.sheetnames[0]]
+    decimals_col = _find_decimals_col(ws)
+    if (decimals_col - 2) % 3 != 0:
+        raise LookupError(
+            f"位数列在第 {decimals_col} 列，与 K 组三元组布局不兼容"
+            "（需满足 (col-2) % 3 == 0）"
+        )
+    k = (decimals_col - 2) // 3
+    if k < 2:
+        raise LookupError(f"组数 K={k} < 2，至少需要两组数据")
+
     out: list[RowSpec] = []
     for row_idx in range(2, ws.max_row + 1):
         metric = ws.cell(row=row_idx, column=1).value
-        n = _coerce_positive_int(ws.cell(row=row_idx, column=2).value)
-        mean1 = _coerce_float(ws.cell(row=row_idx, column=3).value)
-        sd1 = _coerce_float(ws.cell(row=row_idx, column=4).value)
-        m = _coerce_positive_int(ws.cell(row=row_idx, column=5).value)
-        mean2 = _coerce_float(ws.cell(row=row_idx, column=6).value)
-        sd2 = _coerce_float(ws.cell(row=row_idx, column=7).value)
 
-        if metric is None and n is None and mean1 is None:
+        if all(
+            ws.cell(row=row_idx, column=c).value is None
+            for c in range(1, decimals_col + 1)
+        ):
             continue
 
         problems: list[str] = []
         if not isinstance(metric, str) or not metric.strip():
             problems.append("缺少指标名")
-        for label, val in (("N", n), ("M", m)):
-            if val is None or val <= 1:
-                problems.append(f"{label} 必须是 ≥2 的整数")
-        for label, val in (("第一组均值", mean1), ("第二组均值", mean2)):
-            if val is None:
-                problems.append(f"{label} 缺失或非数值")
-        for label, val in (("第一组 SD", sd1), ("第二组 SD", sd2)):
-            if val is None or val <= 0:
-                problems.append(f"{label} 必须是 >0 的数值")
+
+        groups: list[GroupSpec] = []
+        for i in range(k):
+            base = 2 + 3 * i
+            n = _coerce_int(ws.cell(row=row_idx, column=base).value)
+            mean = _coerce_float(ws.cell(row=row_idx, column=base + 1).value)
+            sd = _coerce_float(ws.cell(row=row_idx, column=base + 2).value)
+            if n is None or n <= 1:
+                problems.append(f"G{i + 1} 的 N 必须是 ≥2 的整数")
+            if mean is None:
+                problems.append(f"G{i + 1} 的均值缺失或非数值")
+            if sd is None or sd <= 0:
+                problems.append(f"G{i + 1} 的 SD 必须是 >0 的数值")
+            if (
+                n is not None
+                and n > 1
+                and mean is not None
+                and sd is not None
+                and sd > 0
+            ):
+                groups.append(GroupSpec(name=f"G{i + 1}", n=n, mean=mean, sd=sd))
+
+        decimals = _coerce_int(ws.cell(row=row_idx, column=decimals_col).value)
+        if decimals is None or decimals < 0:
+            problems.append("decimals 缺失或为负")
+
         if problems:
             logger.warning(
                 "跳过第 %d 行（%r）：%s", row_idx, metric, "；".join(problems)
@@ -96,9 +131,9 @@ def read_specs(path: Path, sheet: str | None) -> list[RowSpec]:
         out.append(
             RowSpec(
                 row_index=row_idx,
-                metric=metric,
-                group1=GroupSpec(name="第一组", n=n, mean=mean1, sd=sd1),
-                group2=GroupSpec(name="第二组", n=m, mean=mean2, sd=sd2),
+                metric=metric,  # type: ignore[arg-type]
+                groups=tuple(groups),
+                decimals=decimals,  # type: ignore[arg-type]
             )
         )
     return out
@@ -109,16 +144,19 @@ def generate_one_group(
     target_sd: float,
     size: int,
     rng: np.random.Generator,
+    decimals: int,
 ) -> np.ndarray:
-    """采样标准正态后做线性变换，使未 round 前 mean/SD 严格匹配目标，再 round 到 4 位小数。"""
+    """采样标准正态后做线性变换严格匹配 target，再按 decimals round。"""
     if size < 2:
         raise ValueError(f"size 必须 ≥2，收到 {size}")
     if target_sd <= 0:
         raise ValueError(f"target_sd 必须 >0，收到 {target_sd}")
+    if decimals < 0:
+        raise ValueError(f"decimals 必须 ≥0，收到 {decimals}")
     z = rng.standard_normal(size)
     z = (z - z.mean()) / z.std(ddof=1)
     x = target_mean + target_sd * z
-    return np.round(x, ROUND_DIGITS)
+    return np.round(x, decimals)
 
 
 def generate_with_retry(
@@ -127,21 +165,23 @@ def generate_with_retry(
     target_sd: float,
     size: int,
     rng: np.random.Generator,
+    decimals: int,
 ) -> np.ndarray:
     """在 SD ±10% 容差内重试，最多 MAX_RETRY 次，仍失败抛 RuntimeError。"""
     last_actual_sd: float | None = None
     for attempt in range(1, MAX_RETRY + 1):
         seed = int(rng.integers(0, 2**32 - 1))
         sub_rng = np.random.default_rng(seed)
-        x = generate_one_group(target_mean, target_sd, size, sub_rng)
+        x = generate_one_group(target_mean, target_sd, size, sub_rng, decimals)
         actual_sd = float(np.std(x, ddof=1))
         last_actual_sd = actual_sd
         rel_err = abs(actual_sd - target_sd) / target_sd
         logger.debug(
-            "metric=%s attempt=%d size=%d target_sd=%.6f actual_sd=%.6f rel_err=%.4f",
+            "metric=%s attempt=%d size=%d decimals=%d target_sd=%.6f actual_sd=%.6f rel_err=%.4f",
             metric,
             attempt,
             size,
+            decimals,
             target_sd,
             actual_sd,
             rel_err,
@@ -154,86 +194,218 @@ def generate_with_retry(
     )
 
 
-def compute_stats(
-    g1: np.ndarray, g2: np.ndarray, alpha: float = LEVENE_ALPHA
-) -> tuple[float, float, float, float, float, bool]:
-    """返回 (mean1, sd1, mean2, sd2, p_value, equal_var)。"""
-    mean1 = float(np.mean(g1))
-    sd1 = float(np.std(g1, ddof=1))
-    mean2 = float(np.mean(g2))
-    sd2 = float(np.std(g2, ddof=1))
-    levene_p = float(sp_stats.levene(g1, g2, center="median").pvalue)
-    equal_var = levene_p >= alpha
-    p_value = float(sp_stats.ttest_ind(g1, g2, equal_var=equal_var).pvalue)
-    logger.debug(
-        "compute_stats levene_p=%.4f equal_var=%s p_value=%.4f",
-        levene_p,
-        equal_var,
-        p_value,
-    )
-    return mean1, sd1, mean2, sd2, p_value, equal_var
+def compute_levene(
+    groups: list[np.ndarray], alpha: float = LEVENE_ALPHA
+) -> tuple[float, bool]:
+    """Brown-Forsythe Levene with center='median'. Returns (p, equal_var)."""
+    res = sp_stats.levene(*groups, center="median")
+    p = float(res.pvalue)
+    if np.isnan(p):
+        return float("nan"), False
+    return p, p > alpha
+
+
+def compute_shapiro_min(
+    groups: list[np.ndarray], alpha: float = LEVENE_ALPHA
+) -> tuple[float, bool]:
+    """Per-group Shapiro-Wilk; return (min p, all_normal)."""
+    ps: list[float] = []
+    for i, g in enumerate(groups, start=1):
+        if len(g) < 3:
+            logger.warning(
+                "G%d 样本量 N=%d < 3，Shapiro-Wilk 视为 0（不正态）", i, len(g)
+            )
+            ps.append(0.0)
+            continue
+        try:
+            res = sp_stats.shapiro(g)
+            p = float(res.pvalue)
+            if np.isnan(p):
+                p = 0.0
+            ps.append(p)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("G%d Shapiro-Wilk 失败: %s，视为 0", i, e)
+            ps.append(0.0)
+    min_p = min(ps)
+    return min_p, min_p > alpha
+
+
+def compute_overall(groups: list[np.ndarray], equal_var: bool) -> tuple[float, str]:
+    """ANOVA when equal_var else Kruskal-Wallis. Returns (p, label)."""
+    if equal_var:
+        res = sp_stats.f_oneway(*groups)
+        return float(res.pvalue), "ANOVA"
+    res = sp_stats.kruskal(*groups)
+    return float(res.pvalue), "KW"
+
+
+def compute_pairwise(
+    groups: list[np.ndarray], equal_var: bool, all_normal: bool
+) -> tuple[list[float], list[float | None], str]:
+    """Tukey HSD when equal_var+all_normal else Welch+Bonferroni.
+
+    Returns (raw_ps, q_values, label). q_values are all None for the Tukey branch.
+    """
+    k = len(groups)
+    pairs = list(itertools.combinations(range(k), 2))
+    if equal_var and all_normal:
+        matrix = sp_stats.tukey_hsd(*groups).pvalue
+        raw = [float(matrix[i][j]) for i, j in pairs]
+        q: list[float | None] = [None] * len(pairs)
+        return raw, q, "Tukey"
+    raw = [
+        float(sp_stats.ttest_ind(groups[i], groups[j], equal_var=False).pvalue)
+        for i, j in pairs
+    ]
+    n_pairs = len(pairs)
+    q = [min(1.0, r * n_pairs) for r in raw]
+    return raw, q, "Welch+Bonferroni"
+
+
+@dataclass(slots=True, frozen=True)
+class StatColIndices:
+    mean_sd_pairs: tuple[tuple[int, int], ...]
+    levene: int
+    shapiro_min: int
+    overall: int
+    pairwise_raw: tuple[int, ...]
+    pairwise_q: tuple[int, ...]
 
 
 @dataclass(slots=True, frozen=True)
 class Layout:
-    group1_cols: range
-    group2_cols: range
-    stat_cols: range
+    decimals_col: int
+    group_cols: tuple[range, ...]
+    stat_cols: StatColIndices
 
 
-def compute_layout(n: int, m: int) -> Layout:
-    if n < 2 or m < 2:
-        raise ValueError(f"N、M 必须 ≥2，收到 N={n}、M={m}")
-    g1_start = GROUP1_START_COL
-    g1_end = g1_start + n - 1
-    g2_start = g1_end + 2
-    g2_end = g2_start + m - 1
-    stat_start = g2_end + 2
-    stat_end = stat_start + 4
+def compute_layout(decimals_col: int, group_sizes: tuple[int, ...]) -> Layout:
+    if len(group_sizes) < 2:
+        raise ValueError(f"组数必须 ≥2，收到 {len(group_sizes)}")
+    if any(n < 2 for n in group_sizes):
+        raise ValueError(f"每组 N 必须 ≥2，收到 {group_sizes}")
+
+    data_start = decimals_col + 2
+    group_cols: list[range] = []
+    cursor = data_start
+    for n in group_sizes:
+        group_cols.append(range(cursor, cursor + n))
+        cursor += n + 1  # n cells + 1 blank between groups
+    # cursor now points 1 past the trailing blank — that is exactly stats_start.
+    stats_start = cursor
+
+    pair_cols: list[tuple[int, int]] = []
+    c = stats_start
+    for _ in group_sizes:
+        pair_cols.append((c, c + 1))
+        c += 2
+
+    levene = c
+    c += 1
+    shapiro = c
+    c += 1
+    overall = c
+    c += 1
+
+    k = len(group_sizes)
+    n_pairs = k * (k - 1) // 2
+    raw = tuple(range(c, c + n_pairs))
+    c += n_pairs
+    q = tuple(range(c, c + n_pairs))
+
     return Layout(
-        group1_cols=range(g1_start, g1_end + 1),
-        group2_cols=range(g2_start, g2_end + 1),
-        stat_cols=range(stat_start, stat_end + 1),
+        decimals_col=decimals_col,
+        group_cols=tuple(group_cols),
+        stat_cols=StatColIndices(
+            mean_sd_pairs=tuple(pair_cols),
+            levene=levene,
+            shapiro_min=shapiro,
+            overall=overall,
+            pairwise_raw=raw,
+            pairwise_q=q,
+        ),
     )
+
+
+def _write_group_data_headers(
+    ws: Worksheet,
+    group_cols: tuple[range, ...],
+    group_sizes: tuple[int, ...],
+) -> None:
+    """第 1 行写入每组的列序号 1..N-1，最后一格写 '<N>（Gi）'."""
+    for i, (cols, n) in enumerate(zip(group_cols, group_sizes, strict=True), start=1):
+        last = cols.stop - 1
+        for idx, col in enumerate(cols, start=1):
+            ws.cell(row=1, column=col).value = f"{n}（G{i}）" if col == last else idx
+
+
+def _write_stat_headers(ws: Worksheet, stat_cols: StatColIndices, k: int) -> None:
+    """第 1 行补写统计列表头（仅当原表头为空）."""
+    headers: list[tuple[int, str]] = []
+    for i, (mu_col, sd_col) in enumerate(stat_cols.mean_sd_pairs, start=1):
+        headers.append((mu_col, f"第{i}组均值"))
+        headers.append((sd_col, f"第{i}组SD值"))
+    headers.append((stat_cols.levene, LEVENE_HEADER))
+    headers.append((stat_cols.shapiro_min, SHAPIRO_HEADER))
+    headers.append((stat_cols.overall, OVERALL_HEADER))
+    pair_labels = [f"G{i + 1}-G{j + 1}" for i, j in itertools.combinations(range(k), 2)]
+    for col, label in zip(stat_cols.pairwise_raw, pair_labels, strict=True):
+        headers.append((col, f"{label} raw p"))
+    for col, label in zip(stat_cols.pairwise_q, pair_labels, strict=True):
+        headers.append((col, f"{label} Q-value"))
+    for col, text in headers:
+        if ws.cell(row=1, column=col).value in (None, ""):
+            ws.cell(row=1, column=col).value = text
+
+
+def _round_stat(v: float | None) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, float) and np.isnan(v):
+        return None
+    return round(float(v), STAT_DIGITS)
 
 
 def write_row(
     ws: Worksheet,
     row: RowSpec,
-    g1: np.ndarray,
-    g2: np.ndarray,
-    stats: tuple[float, float, float, float, float, bool],
+    generated: list[np.ndarray],
     layout: Layout,
+    levene_p: float,
+    sw_min_p: float,
+    overall_p: float,
+    raw_ps: list[float],
+    q_values: list[float | None],
 ) -> None:
-    mean1, sd1, mean2, sd2, p_value, _equal_var = stats
+    group_sizes = tuple(g.n for g in row.groups)
+    _write_group_data_headers(ws, layout.group_cols, group_sizes)
+    _write_stat_headers(ws, layout.stat_cols, len(row.groups))
 
-    last_g1_col = layout.group1_cols.stop - 1
-    for idx, col in enumerate(layout.group1_cols, start=1):
-        if col == last_g1_col:
-            ws.cell(row=1, column=col).value = f"{row.group1.n}（N）"
-        else:
-            ws.cell(row=1, column=col).value = idx
+    for cols, data in zip(layout.group_cols, generated, strict=True):
+        for value, col in zip(data.tolist(), cols, strict=True):
+            ws.cell(row=row.row_index, column=col).value = value
 
-    last_g2_col = layout.group2_cols.stop - 1
-    for idx, col in enumerate(layout.group2_cols, start=1):
-        if col == last_g2_col:
-            ws.cell(row=1, column=col).value = f"{row.group2.n}（M）"
-        else:
-            ws.cell(row=1, column=col).value = idx
+    actual_means = [float(np.mean(d)) for d in generated]
+    actual_sds = [float(np.std(d, ddof=1)) for d in generated]
+    for (mu_col, sd_col), mu, sd in zip(
+        layout.stat_cols.mean_sd_pairs, actual_means, actual_sds, strict=True
+    ):
+        ws.cell(row=row.row_index, column=mu_col).value = _round_stat(mu)
+        ws.cell(row=row.row_index, column=sd_col).value = _round_stat(sd)
 
-    for header, col in zip(STAT_HEADERS, layout.stat_cols, strict=True):
-        existing = ws.cell(row=1, column=col).value
-        if existing in (None, ""):
-            ws.cell(row=1, column=col).value = header
-
-    for value, col in zip(g1.tolist(), layout.group1_cols, strict=True):
-        ws.cell(row=row.row_index, column=col).value = value
-    for value, col in zip(g2.tolist(), layout.group2_cols, strict=True):
-        ws.cell(row=row.row_index, column=col).value = value
-
-    stat_values = (mean1, sd1, mean2, sd2, p_value)
-    for value, col in zip(stat_values, layout.stat_cols, strict=True):
-        ws.cell(row=row.row_index, column=col).value = float(value)
+    ws.cell(row=row.row_index, column=layout.stat_cols.levene).value = _round_stat(
+        levene_p
+    )
+    ws.cell(row=row.row_index, column=layout.stat_cols.shapiro_min).value = _round_stat(
+        sw_min_p
+    )
+    ws.cell(row=row.row_index, column=layout.stat_cols.overall).value = _round_stat(
+        overall_p
+    )
+    for col, p in zip(layout.stat_cols.pairwise_raw, raw_ps, strict=True):
+        ws.cell(row=row.row_index, column=col).value = _round_stat(p)
+    for col, q in zip(layout.stat_cols.pairwise_q, q_values, strict=True):
+        ws.cell(row=row.row_index, column=col).value = _round_stat(q)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -265,37 +437,59 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _process_rows(
-    ws: Worksheet, specs: Iterable[RowSpec], rng: np.random.Generator
+    ws: Worksheet,
+    specs: Iterable[RowSpec],
+    rng: np.random.Generator,
+    decimals_col: int,
 ) -> int:
-    """对每行 spec 执行 generate→compute→write，返回成功处理的行数。"""
+    """对每行 spec 执行 generate → 4 个 stats → write，返回成功处理的行数。"""
     count = 0
     for spec in specs:
-        layout = compute_layout(spec.group1.n, spec.group2.n)
-        seed1 = int(rng.integers(0, 2**32 - 1))
-        seed2 = int(rng.integers(0, 2**32 - 1))
-        g1 = generate_with_retry(
-            metric=f"{spec.metric}/G1",
-            target_mean=spec.group1.mean,
-            target_sd=spec.group1.sd,
-            size=spec.group1.n,
-            rng=np.random.default_rng(seed1),
+        group_sizes = tuple(g.n for g in spec.groups)
+        layout = compute_layout(decimals_col, group_sizes)
+
+        generated: list[np.ndarray] = []
+        for i, g in enumerate(spec.groups, start=1):
+            seed = int(rng.integers(0, 2**32 - 1))
+            arr = generate_with_retry(
+                metric=f"{spec.metric}/G{i}",
+                target_mean=g.mean,
+                target_sd=g.sd,
+                size=g.n,
+                rng=np.random.default_rng(seed),
+                decimals=spec.decimals,
+            )
+            generated.append(arr)
+
+        levene_p, equal_var = compute_levene(generated)
+        sw_min_p, all_normal = compute_shapiro_min(generated)
+        overall_p, overall_label = compute_overall(generated, equal_var)
+        raw_ps, q_values, branch_label = compute_pairwise(
+            generated, equal_var, all_normal
         )
-        g2 = generate_with_retry(
-            metric=f"{spec.metric}/G2",
-            target_mean=spec.group2.mean,
-            target_sd=spec.group2.sd,
-            size=spec.group2.n,
-            rng=np.random.default_rng(seed2),
+
+        write_row(
+            ws,
+            spec,
+            generated,
+            layout,
+            levene_p,
+            sw_min_p,
+            overall_p,
+            raw_ps,
+            q_values,
         )
-        stats_tuple = compute_stats(g1, g2)
-        write_row(ws, spec, g1, g2, stats_tuple, layout)
         count += 1
         logger.info(
-            "处理完成 row=%d metric=%s p_value=%.4f equal_var=%s",
+            "处理完成 row=%d metric=%s K=%d levene_p=%.4f all_normal=%s overall=%s(%.4f) pairwise=%s",
             spec.row_index,
             spec.metric,
-            stats_tuple[4],
-            stats_tuple[5],
+            len(spec.groups),
+            levene_p,
+            all_normal,
+            overall_label,
+            overall_p,
+            branch_label,
         )
     return count
 
@@ -317,14 +511,21 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("输入文件不存在: %s", input_path)
         return 2
 
-    specs = read_specs(input_path, args.sheet)
+    try:
+        specs = read_specs(input_path, args.sheet)
+    except LookupError as e:
+        logger.error("无法解析输入文件结构: %s", e)
+        return 3
+
     if not specs:
         logger.warning("没有有效行可处理，退出")
         return 0
 
     wb = load_workbook(input_path)
     ws: Worksheet = wb[args.sheet] if args.sheet else wb[wb.sheetnames[0]]
-    n = _process_rows(ws, specs, rng)
+    decimals_col = _find_decimals_col(ws)
+    logger.info("识别到位数列在第 %d 列, K=%d", decimals_col, (decimals_col - 2) // 3)
+    n = _process_rows(ws, specs, rng, decimals_col)
     wb.save(output_path)
     logger.info("已写入 %d 行 → %s", n, output_path)
     return 0
