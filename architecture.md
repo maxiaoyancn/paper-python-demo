@@ -41,19 +41,22 @@ col(3+3K) 备注列（可选，脚本不读不写）
 ```
 data_start = decimals_col + 2
 G_i 占 N_i 列，组间空 1 列
-G_i 最后一格表头覆写为 "<N_i>（G<i>）"
+每个数据列表头覆写为 "<letter><idx>"，idx 从 1 起；letter = 第 i 个英文大写字母
+（K 上限 26，对应 A..Z；K>26 退出码 3）
 ```
 
 统计区（数据区结束 + 1 空列起，按顺序）：
 
 | 列 | 含义 | 备注 |
 |---|---|---|
-| 2K 列 | μ_i, σ_i 交替（i=1..K） | 4 位小数 |
+| 2K 列 | "<letter> 组均值"、"<letter> 组SD值"（i=1..K） | 4 位小数 |
 | 1 列 | Levene p（center=median, Brown-Forsythe） | > 0.05 视为方差齐 |
+| 1 列 | 是否方差齐（Y/N） | Y 当且仅当 Levene p > 0.05 |
 | 1 列 | Shapiro-Wilk min p（每组 SW 取最小） | > 0.05 视为全部正态 |
+| 1 列 | 是否正态（Y/N） | Y 当且仅当 SW min p > 0.05 |
 | 1 列 | 整体 p | 齐 → ANOVA(`f_oneway`)；不齐 → KW(`kruskal`) |
-| C(K,2) 列 | 两两 raw p | 顺序：(1,2)(1,3)(2,3)(1,4)... |
-| C(K,2) 列 | 两两 Q-value | 齐+全正态 → Tukey HSD（留空）；否则 → Welch t + Bonferroni |
+| C(K,2) 列 | 两两 raw p（"<letter_i>-<letter_j> raw p"） | 顺序：(1,2)(1,3)(2,3)(1,4)... |
+| C(K,2) 列 | 两两 Q-value（"<letter_i>-<letter_j> Q-value"） | 齐+全正态 → Tukey HSD（留空）；否则 → Welch t + Bonferroni |
 
 #### 关键决策（参见已归档 changes 的 design.md）
 
@@ -74,3 +77,4 @@ G_i 最后一格表头覆写为 "<N_i>（G<i>）"
 
 - **2026-05-09** [add-excel-random-data-generator](openspec/changes/archive/2026-05-09-add-excel-random-data-generator/)：v1 落地，仅支持 K=2，输出 5 列统计（μ1/σ1/μ2/σ2/p）。
 - **2026-05-09** [extend-to-multi-group-stats](openspec/changes/archive/2026-05-09-extend-to-multi-group-stats/)：扩展为 K 组 + 行级 decimals + 完整多组统计流水线（Levene → SW → ANOVA/KW → Tukey HSD / Welch+Bonferroni）。BREAKING：列布局重定义，统计列从 5 个变为 2K + 3 + 2·C(K,2) 个。
+- **2026-05-10** [use-group-letters-and-normality-flag](openspec/changes/archive/2026-05-09-use-group-letters-and-normality-flag/)：原始数据列表头与统计列表头统一改用字母（A/B/C…）+ 索引（A1, A2, …）；新增"是否方差齐" / "是否正态" 两个 Y/N 结论列分别紧跟 Levene p / SW min p；K 上限 26（A..Z）。BREAKING：统计列总数从 2K + 3 + 2·C(K,2) 增至 2K + 5 + 2·C(K,2)（K=2: 9→11 / K=3: 15→17 / K=4: 23→25）。

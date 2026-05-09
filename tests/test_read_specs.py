@@ -87,3 +87,25 @@ def test_read_specs_no_decimals_col_raises(tmp_path):
     wb.save(p)
     with pytest.raises(LookupError):
         read_specs(p, sheet=None)
+
+
+def test_read_specs_k_gt_26_raises(tmp_path):
+    """K=27 (decimals_col=83 = '原始数据小数点后位数') should be rejected."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    headers = ["指标"]
+    for i in range(27):
+        headers.extend([f"G{i + 1} N", f"G{i + 1} mean", f"G{i + 1} SD"])
+    headers.append("原始数据小数点后位数")
+    for c, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=c).value = h
+    row = ["x"]
+    for _ in range(27):
+        row.extend([5, 1.0, 1.0])
+    row.append(4)
+    for c, v in enumerate(row, start=1):
+        ws.cell(row=2, column=c).value = v
+    p = tmp_path / "k27.xlsx"
+    wb.save(p)
+    with pytest.raises(LookupError, match="超过 26"):
+        read_specs(p, sheet=None)

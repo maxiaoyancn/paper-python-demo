@@ -1,7 +1,7 @@
-"""Build K=3 / K=4 fixture xlsx files for v2 tests.
+"""Build sample-k2 / k3 / k4 fixture xlsx files for v3 tests.
 
 Layout reminder (K groups):
-    A1=指标; B-D=组1 (N,μ,σ); E-G=组2; H-J=组3 (when K≥3); ... ;
+    A1=指标; B-D=组1 (N,μ,σ); E-G=组2 (...); H-J=组3 (when K≥3); ... ;
     decimals_col = col(2 + 3K); decimals_col + 1 = remarks (optional);
     decimals_col + 2 onward = data area (script writes here).
 """
@@ -11,6 +11,33 @@ from __future__ import annotations
 from pathlib import Path
 
 import openpyxl
+
+
+def build_k2(path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    headers = [
+        "指标",
+        "G1 N",
+        "G1 mean",
+        "G1 SD",
+        "G2 N",
+        "G2 mean",
+        "G2 SD",
+        "原始数据小数点后位数",
+        "备注（脚本不读）",
+    ]
+    for c, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=c).value = h
+    rows = [
+        ("体重", 10, 120.6263, 10.3698, 12, 110.36, 9.8635, 4),
+        ("身高", 10, 170.9583, 20.3677, 12, 153.6394, 10.2658, 4),
+        ("血糖", 10, 5.6984, 2.6935, 12, 9.6998, 3.6987, 4),
+    ]
+    for r, row in enumerate(rows, start=2):
+        for c, v in enumerate(row, start=1):
+            ws.cell(row=r, column=c).value = v
+    wb.save(path)
 
 
 def build_k3(path: Path) -> None:
@@ -72,6 +99,7 @@ def build_k4(path: Path) -> None:
 
 if __name__ == "__main__":
     here = Path(__file__).parent
+    build_k2(here / "sample-k2.xlsx")
     build_k3(here / "sample-k3.xlsx")
     build_k4(here / "sample-k4.xlsx")
     print("ok")

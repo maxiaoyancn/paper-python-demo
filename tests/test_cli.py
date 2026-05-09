@@ -25,9 +25,23 @@ def test_cli_requires_input_argument(capsys):
     assert "--input" in capsys.readouterr().err
 
 
+def _clear_row1_after_inputs(path: Path, decimals_col: int) -> None:
+    """Clear row 1 cells beyond the input area so the script writes fresh v3 headers.
+
+    Without this, stale v1/v2 stat headers in the fixture would be preserved by the
+    'non-empty header is kept' policy, masking v3 header behavior.
+    """
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    for c in range(decimals_col + 1, ws.max_column + 1):
+        ws.cell(row=1, column=c).value = None
+    wb.save(path)
+
+
 def test_cli_writes_expected_layout_k2(tmp_path: Path):
     src = tmp_path / "in.xlsx"
     shutil.copy(SAMPLE_K2, src)
+    _clear_row1_after_inputs(src, decimals_col=8)  # K=2: decimals_col=H=8
     rc = main(["--input", str(src), "--output", str(src), "--seed", "42"])
     assert rc == 0
 
@@ -48,9 +62,19 @@ def test_cli_writes_expected_layout_k2(tmp_path: Path):
     col_T = column_index_from_string("T")
     col_U = column_index_from_string("U")
     col_AF = column_index_from_string("AF")
-    col_AL = column_index_from_string("AL")
-    assert ws_out.cell(row=1, column=col_S).value == "10（G1）"
-    assert ws_out.cell(row=1, column=col_AF).value == "12（G2）"
+    col_AL = column_index_from_string("AL")  # Levene p
+
+    # New letter-based data headers
+    assert ws_out.cell(row=1, column=col_J).value == "A1"
+    assert ws_out.cell(row=1, column=col_S).value == "A10"
+    assert ws_out.cell(row=1, column=col_U).value == "B1"
+    assert ws_out.cell(row=1, column=col_AF).value == "B12"
+
+    # Stat headers row 1
+    assert ws_out.cell(row=1, column=col_AL).value == "Levene p"
+    assert ws_out.cell(row=1, column=col_AL + 1).value == "是否方差齐"
+    assert ws_out.cell(row=1, column=col_AL + 2).value == "Shapiro-Wilk min p"
+    assert ws_out.cell(row=1, column=col_AL + 3).value == "是否正态"
 
     for r in range(2, 5):
         assert ws_out.cell(row=r, column=col_T).value is None  # blank between groups
@@ -73,13 +97,16 @@ def test_cli_writes_expected_layout_k2(tmp_path: Path):
     else:
         expected_overall = float(sp_stats.kruskal(g1, g2).pvalue)
 
+    # col offsets: 0=Levene, 1=levene_flag, 2=SW, 3=normality_flag, 4=overall
     assert ws_out.cell(row=2, column=col_AL).value == pytest.approx(
         round(expected_levene, 4)
     )
-    assert ws_out.cell(row=2, column=col_AL + 1).value == pytest.approx(
+    assert ws_out.cell(row=2, column=col_AL + 1).value in ("Y", "N")
+    assert ws_out.cell(row=2, column=col_AL + 2).value == pytest.approx(
         round(expected_sw, 4)
     )
-    assert ws_out.cell(row=2, column=col_AL + 2).value == pytest.approx(
+    assert ws_out.cell(row=2, column=col_AL + 3).value in ("Y", "N")
+    assert ws_out.cell(row=2, column=col_AL + 4).value == pytest.approx(
         round(expected_overall, 4)
     )
 
@@ -87,6 +114,7 @@ def test_cli_writes_expected_layout_k2(tmp_path: Path):
 def test_cli_writes_expected_layout_k3(tmp_path: Path):
     src = tmp_path / "in.xlsx"
     shutil.copy(SAMPLE_K3, src)
+    _clear_row1_after_inputs(src, decimals_col=11)  # K=3: decimals_col=K=11
     rc = main(["--input", str(src), "--output", str(src), "--seed", "42"])
     assert rc == 0
 
@@ -103,16 +131,23 @@ def test_cli_writes_expected_layout_k3(tmp_path: Path):
     col_T = column_index_from_string("T")
     col_AE = column_index_from_string("AE")
     col_AR = column_index_from_string("AR")
-    assert ws.cell(row=1, column=col_T).value == "8（G1）"
-    assert ws.cell(row=1, column=col_AE).value == "10（G2）"
-    assert ws.cell(row=1, column=col_AR).value == "12（G3）"
+    assert ws.cell(row=1, column=col_T).value == "A8"
+    assert ws.cell(row=1, column=col_AE).value == "B10"
+    assert ws.cell(row=1, column=col_AR).value == "C12"
 
-    # data starts: G1 col 13 (M, N=8), gap col 21 (U), G2 col 22 (V, N=10),
-    # gap col 32 (AF), G3 col 33 (AG, N=12). Stats from col 46 (AT).
-    stat_start = 46
+    # K=3 stat block: stat_start=46, mean_sd=46-51,
+    # levene=52, levene_flag=53, SW=54, normality_flag=55,
+    # overall=56, raw=57-59, Q=60-62
+    assert ws.cell(row=1, column=53).value == "是否方差齐"
+    assert ws.cell(row=1, column=55).value == "是否正态"
+    assert ws.cell(row=1, column=57).value == "A-B raw p"
+    assert ws.cell(row=1, column=58).value == "A-C raw p"
+    assert ws.cell(row=1, column=59).value == "B-C raw p"
+    assert ws.cell(row=1, column=60).value == "A-B Q-value"
+
+    raw_start = 57
+    q_start = 60
     pair_count = 3
-    raw_start = stat_start + 6 + 3
-    q_start = raw_start + pair_count
 
     g_starts_lens = [(13, 8), (22, 10), (33, 12)]
     groups = [
@@ -178,3 +213,29 @@ def test_cli_no_decimals_col_returns_3(tmp_path: Path):
     wb.save(p)
     rc = main(["--input", str(p), "--output", str(p)])
     assert rc == 3
+
+
+def test_cli_flags_consistent_with_p_values(tmp_path: Path):
+    """For every data row, levene_flag/normality_flag must match their p-value cells."""
+    src = tmp_path / "in.xlsx"
+    shutil.copy(SAMPLE_K2, src)
+    _clear_row1_after_inputs(src, decimals_col=8)
+    rc = main(["--input", str(src), "--output", str(src), "--seed", "42"])
+    assert rc == 0
+
+    ws = openpyxl.load_workbook(src, data_only=True).active
+    col_AL = column_index_from_string("AL")  # Levene p
+
+    for r in range(2, 5):
+        levene_p = ws.cell(row=r, column=col_AL).value
+        levene_flag = ws.cell(row=r, column=col_AL + 1).value
+        sw_p = ws.cell(row=r, column=col_AL + 2).value
+        normality_flag = ws.cell(row=r, column=col_AL + 3).value
+
+        expected_levene_flag = (
+            "Y" if (levene_p is not None and levene_p > 0.05) else "N"
+        )
+        expected_normality_flag = "Y" if (sw_p is not None and sw_p > 0.05) else "N"
+
+        assert levene_flag == expected_levene_flag, (r, levene_p, levene_flag)
+        assert normality_flag == expected_normality_flag, (r, sw_p, normality_flag)

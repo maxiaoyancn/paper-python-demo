@@ -23,7 +23,9 @@ SD_TOLERANCE = 0.10  # ±10%
 MAX_RETRY = 5
 STAT_DIGITS = 4  # 统计回算列固定 4 位小数
 LEVENE_HEADER = "Levene p"
+LEVENE_FLAG_HEADER = "是否方差齐"
 SHAPIRO_HEADER = "Shapiro-Wilk min p"
+NORMALITY_FLAG_HEADER = "是否正态"
 OVERALL_HEADER = "整体 p（ANOVA/KW）"
 
 
@@ -41,6 +43,13 @@ class RowSpec:
     metric: str
     groups: tuple[GroupSpec, ...]
     decimals: int
+
+
+def _letter(i: int) -> str:
+    """1 → 'A', 2 → 'B', ..., 26 → 'Z'. Raises ValueError for i outside 1..26."""
+    if i < 1 or i > 26:
+        raise ValueError(f"组序号必须在 1..26 内，收到 {i}")
+    return chr(ord("A") + i - 1)
 
 
 def _find_decimals_col(ws: Worksheet) -> int:
@@ -82,6 +91,8 @@ def read_specs(path: Path, sheet: str | None) -> list[RowSpec]:
     k = (decimals_col - 2) // 3
     if k < 2:
         raise LookupError(f"组数 K={k} < 2，至少需要两组数据")
+    if k > 26:
+        raise LookupError(f"组数 K={k} 超过 26 上限（字母 A..Z 范围）")
 
     out: list[RowSpec] = []
     for row_idx in range(2, ws.max_row + 1):
@@ -266,7 +277,9 @@ def compute_pairwise(
 class StatColIndices:
     mean_sd_pairs: tuple[tuple[int, int], ...]
     levene: int
+    levene_flag: int
     shapiro_min: int
+    normality_flag: int
     overall: int
     pairwise_raw: tuple[int, ...]
     pairwise_q: tuple[int, ...]
@@ -302,7 +315,11 @@ def compute_layout(decimals_col: int, group_sizes: tuple[int, ...]) -> Layout:
 
     levene = c
     c += 1
+    levene_flag = c
+    c += 1
     shapiro = c
+    c += 1
+    normality_flag = c
     c += 1
     overall = c
     c += 1
@@ -319,7 +336,9 @@ def compute_layout(decimals_col: int, group_sizes: tuple[int, ...]) -> Layout:
         stat_cols=StatColIndices(
             mean_sd_pairs=tuple(pair_cols),
             levene=levene,
+            levene_flag=levene_flag,
             shapiro_min=shapiro,
+            normality_flag=normality_flag,
             overall=overall,
             pairwise_raw=raw,
             pairwise_q=q,
@@ -332,23 +351,29 @@ def _write_group_data_headers(
     group_cols: tuple[range, ...],
     group_sizes: tuple[int, ...],
 ) -> None:
-    """第 1 行写入每组的列序号 1..N-1，最后一格写 '<N>（Gi）'."""
-    for i, (cols, n) in enumerate(zip(group_cols, group_sizes, strict=True), start=1):
-        last = cols.stop - 1
+    """第 1 行写入每组的列表头：<letter><idx>（如 A1, A2, ..., A10）."""
+    for i, (cols, _n) in enumerate(zip(group_cols, group_sizes, strict=True), start=1):
+        letter = _letter(i)
         for idx, col in enumerate(cols, start=1):
-            ws.cell(row=1, column=col).value = f"{n}（G{i}）" if col == last else idx
+            ws.cell(row=1, column=col).value = f"{letter}{idx}"
 
 
 def _write_stat_headers(ws: Worksheet, stat_cols: StatColIndices, k: int) -> None:
     """第 1 行补写统计列表头（仅当原表头为空）."""
     headers: list[tuple[int, str]] = []
     for i, (mu_col, sd_col) in enumerate(stat_cols.mean_sd_pairs, start=1):
-        headers.append((mu_col, f"第{i}组均值"))
-        headers.append((sd_col, f"第{i}组SD值"))
+        letter = _letter(i)
+        headers.append((mu_col, f"{letter} 组均值"))
+        headers.append((sd_col, f"{letter} 组SD值"))
     headers.append((stat_cols.levene, LEVENE_HEADER))
+    headers.append((stat_cols.levene_flag, LEVENE_FLAG_HEADER))
     headers.append((stat_cols.shapiro_min, SHAPIRO_HEADER))
+    headers.append((stat_cols.normality_flag, NORMALITY_FLAG_HEADER))
     headers.append((stat_cols.overall, OVERALL_HEADER))
-    pair_labels = [f"G{i + 1}-G{j + 1}" for i, j in itertools.combinations(range(k), 2)]
+    pair_labels = [
+        f"{_letter(i + 1)}-{_letter(j + 1)}"
+        for i, j in itertools.combinations(range(k), 2)
+    ]
     for col, label in zip(stat_cols.pairwise_raw, pair_labels, strict=True):
         headers.append((col, f"{label} raw p"))
     for col, label in zip(stat_cols.pairwise_q, pair_labels, strict=True):
@@ -372,7 +397,9 @@ def write_row(
     generated: list[np.ndarray],
     layout: Layout,
     levene_p: float,
+    equal_var: bool,
     sw_min_p: float,
+    all_normal: bool,
     overall_p: float,
     raw_ps: list[float],
     q_values: list[float | None],
@@ -396,8 +423,14 @@ def write_row(
     ws.cell(row=row.row_index, column=layout.stat_cols.levene).value = _round_stat(
         levene_p
     )
+    ws.cell(row=row.row_index, column=layout.stat_cols.levene_flag).value = (
+        "Y" if equal_var else "N"
+    )
     ws.cell(row=row.row_index, column=layout.stat_cols.shapiro_min).value = _round_stat(
         sw_min_p
+    )
+    ws.cell(row=row.row_index, column=layout.stat_cols.normality_flag).value = (
+        "Y" if all_normal else "N"
     )
     ws.cell(row=row.row_index, column=layout.stat_cols.overall).value = _round_stat(
         overall_p
@@ -474,7 +507,9 @@ def _process_rows(
             generated,
             layout,
             levene_p,
+            equal_var,
             sw_min_p,
+            all_normal,
             overall_p,
             raw_ps,
             q_values,
