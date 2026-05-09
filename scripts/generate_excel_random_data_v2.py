@@ -1,4 +1,4 @@
-"""按目标统计量为 Excel 中每行指标生成两组正态分布原始数据，并回算 mean/SD/p 值。"""
+"""按目标统计量为 Excel 中每行指标生成多组正态分布原始数据，并回算 mean/SD/p 值。"""
 
 from __future__ import annotations
 
